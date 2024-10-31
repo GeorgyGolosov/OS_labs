@@ -6,8 +6,12 @@
 Запустить devcontainer через vscode
 Перейти в lab1
 Выполнить сборку:
+```
 mkdir -p build
 cd build
 cmake ..
 make
+```
+```
 Запуск программы ./main
+```
