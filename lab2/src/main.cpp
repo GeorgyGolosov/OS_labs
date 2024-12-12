@@ -21,15 +21,12 @@ void* monte_carlo(void* arg) {
     struct Thread_Data* data = (struct Thread_Data*)arg;
     int inside_circle = 0;
 
-    std::random_device rd;  // Получаем случайное начальное значение
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<double> dis(-data->radius, data->radius);
-
+    unsigned int seed = time(NULL) ^ pthread_self();
     double radius_square = data->radius * data->radius;
 
     for (int i = 0; i < data->points_per_thread; ++i) {
-        double x = dis(gen);
-        double y = dis(gen);
+        double x = (double)rand_r(&seed) / RAND_MAX * data->radius;
+        double y = (double)rand_r(&seed) / RAND_MAX * data->radius;
         if (x * x + y * y <= (radius_square)) {
             inside_circle++;
         }
@@ -59,10 +56,10 @@ int main(int argc, char* argv[]) {
     }
 
     srand(time(NULL));
-    int total_points = 100000000;
+    int total_points = 1000000000; // 10 ^ 9
 
     pthread_t threads[threads_number];
-    int points_per_thread = 100000000 / threads_number;
+    int points_per_thread = total_points / threads_number;
     struct Thread_Data data;
     data.radius = radius;
     data.points_per_thread = points_per_thread;
