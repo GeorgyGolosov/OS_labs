@@ -1,16 +1,15 @@
-// computing.cpp
 #include <iostream>
 #include <string>
 #include <chrono>
 #include <thread>
 #include <map>
 #include <mutex>
-#include <zmq.hpp>
+#include <cstring>
+#include "zmq.h"
 #include "lib.h"
 
 using namespace std;
 
-// Локальный целочисленный словарь вычислительного узла
 std::map<std::string, int> localDict;
 std::mutex dictMutex;
 
@@ -19,92 +18,96 @@ int main(int argc, char* argv[]) {
         std::cerr << "Usage: " << argv[0] << " <node_id> [parent_id]" << std::endl;
         return 1;
     }
-    // Получаем id узла (параметр parent пока не используется в логике вычислительного узла)
-    std::string node_id = argv[1];
+    string node_id = argv[1];
 
-    // Создаём ZeroMQ контекст
-    zmq::context_t context(1);
+    // Создаем контекст и DEALER-сокет через C API
+    void* context = zmq_ctx_new();
+    void* dealer = zmq_socket(context, ZMQ_DEALER);
+    // Устанавливаем identity (идентификатор узла) для возможности маршрутизации
+    zmq_setsockopt(dealer, ZMQ_IDENTITY, node_id.c_str(), node_id.size());
+    zmq_connect(dealer, "tcp://localhost:5555");
 
-    // Создаём DEALER-сокет для приёма команд от управляющего узла.
-    // Устанавливаем identity равным node_id, чтобы управляющий узел мог адресовать этот узел.
-    zmq::socket_t dealer(context, zmq::socket_type::dealer);
-    dealer.set(zmq::sockopt::routing_id, node_id);
-    dealer.connect("tcp://localhost:5555"); // Подключаемся к ROUTER-сокету управляющего узла
+    // Создаем PUSH-сокет для отправки heartbeat-сообщений
+    void* heartbeatSocket = zmq_socket(context, ZMQ_PUSH);
+    zmq_connect(heartbeatSocket, "tcp://localhost:5557");
 
-    // Создаём PUSH-сокет для отправки heartbeat-сообщений.
-    zmq::socket_t heartbeatSocket(context, zmq::socket_type::push);
-    heartbeatSocket.connect("tcp://localhost:5557");
+    int heartbeatInterval = 2000; // Интервал heartbeat в мс
 
-    // Интервал heartbeat в миллисекундах (по умолчанию 2000)
-    int heartbeatInterval = 2000;
-
-    // Отдельный поток для отправки heartbeat каждые heartbeatInterval мс.
+    // Поток отправки heartbeat-сообщений
     std::thread heartbeatThread([&]() {
         while (true) {
-            // Формируем сообщение: "HEARTBEAT <node_id>"
-            std::string hb = "HEARTBEAT " + node_id;
-            zmq::message_t message(hb.size());
-            memcpy(message.data(), hb.c_str(), hb.size());
-            try {
-                heartbeatSocket.send(message, zmq::send_flags::none);
-            } catch (const zmq::error_t &e) {
-                // Обработка ошибок отправки (при необходимости)
-            }
+            string hb = "HEARTBEAT " + node_id;
+            zmq_msg_t msg;
+            zmq_msg_init_size(&msg, hb.size());
+            memcpy(zmq_msg_data(&msg), hb.c_str(), hb.size());
+            zmq_msg_send(&msg, heartbeatSocket, 0);
+            zmq_msg_close(&msg);
             std::this_thread::sleep_for(std::chrono::milliseconds(heartbeatInterval));
         }
     });
 
-    // Основной цикл обработки входящих команд.
+    // Основной цикл обработки входящих команд
     while (true) {
-        zmq::message_t msg;
-        // Получаем первый фрейм
-        auto res = dealer.recv(msg, zmq::recv_flags::none);
-        if (!res)
+        zmq_msg_t msg;
+        zmq_msg_init(&msg);
+        int res = zmq_msg_recv(&msg, dealer, 0);
+        if (res == -1) {
+            zmq_msg_close(&msg);
             continue;
-
-        // Если фрейм пустой, получаем следующий
-        if (msg.size() == 0) {
-            auto res = dealer.recv(msg, zmq::recv_flags::none);
-            (void)res; // явное игнорирование результата
         }
-
-        std::string command(static_cast<char*>(msg.data()), msg.size());
-        auto tokens = split(command);
-        std::string reply;
-
-        if (tokens.size() == 1) { // запрос на чтение: exec id name
-            std::string key = tokens[0];
-            std::lock_guard<std::mutex> lock(dictMutex);
-            auto it = localDict.find(key);
-            if (it != localDict.end()) {
-                reply = "Ok:" + node_id + ": " + std::to_string(it->second);
-            } else {
-                reply = "Ok:" + node_id + ": '" + key + "' not found";
+        // Если первый фрейм пустой (делимитер), пропускаем его и читаем следующий
+        if (zmq_msg_size(&msg) == 0) {
+            zmq_msg_close(&msg);
+            zmq_msg_init(&msg);
+            res = zmq_msg_recv(&msg, dealer, 0);
+            if (res == -1) {
+                zmq_msg_close(&msg);
+                continue;
             }
         }
-        else if (tokens.size() == 2) { // запись: exec id name value
-            std::string key = tokens[0];
-            int value = std::stoi(tokens[1]);
+        string command((char*)zmq_msg_data(&msg), zmq_msg_size(&msg));
+        zmq_msg_close(&msg);
+
+        auto tokens = split(command);
+        string reply;
+        if (tokens.size() == 1) {  // Запрос на чтение: exec id name
+            string key = tokens[0];
+            lock_guard<mutex> lock(dictMutex);
+            auto it = localDict.find(key);
+            if (it != localDict.end())
+                reply = "Ok:" + node_id + ": " + to_string(it->second);
+            else
+                reply = "Ok:" + node_id + ": '" + key + "' not found";
+        }
+        else if (tokens.size() == 2) {  // Запись: exec id name value
+            string key = tokens[0];
+            int value = stoi(tokens[1]);
             {
-                std::lock_guard<std::mutex> lock(dictMutex);
+                lock_guard<mutex> lock(dictMutex);
                 localDict[key] = value;
             }
             reply = "Ok:" + node_id;
-        }
-        else {
+        } else {
             reply = "Error:" + node_id + ": Invalid command format";
         }
 
-        // Отправляем ответ управляющему узлу
-        // Отправляем пустой фрейм-делимитер:
-        zmq::message_t emptyMsg(0);
-        dealer.send(emptyMsg, zmq::send_flags::sndmore);
-        // Отправляем фрейм с ответом:
-        zmq::message_t replyMsg(reply.size());
-        memcpy(replyMsg.data(), reply.c_str(), reply.size());
-        dealer.send(replyMsg, zmq::send_flags::none);
+        // Отправляем ответ управляющему узлу в виде мультифреймового сообщения:
+        // первый фрейм – пустой делимитер, второй – данные ответа.
+        zmq_msg_t emptyMsg;
+        zmq_msg_init_size(&emptyMsg, 0);
+        zmq_msg_send(&emptyMsg, dealer, ZMQ_SNDMORE);
+        zmq_msg_close(&emptyMsg);
+
+        zmq_msg_t replyMsg;
+        zmq_msg_init_size(&replyMsg, reply.size());
+        memcpy(zmq_msg_data(&replyMsg), reply.c_str(), reply.size());
+        zmq_msg_send(&replyMsg, dealer, 0);
+        zmq_msg_close(&replyMsg);
     }
 
-    heartbeatThread.join(); // Этот вызов никогда не будет достигнут
+    heartbeatThread.join(); // На самом деле выполнение сюда не доходит
+    zmq_close(dealer);
+    zmq_close(heartbeatSocket);
+    zmq_ctx_destroy(context);
     return 0;
 }
