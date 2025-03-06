@@ -13,7 +13,7 @@ extern "C" char* translation(long x) {
         x = -x;
     }
 
-    // Для системы счисления с основанием 3 достаточно 42 цифр
+    // 42 цифры достаточно для представления 64-битного числа в троичной системе
     const int MAX_DIGITS = 42;
     char* temp = new char[MAX_DIGITS];
     int pos = 0;
