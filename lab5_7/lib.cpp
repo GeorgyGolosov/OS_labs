@@ -34,7 +34,7 @@ Node createNode(int id, bool is_child) {
     node.pid = getpid();
     node.context = zmq_ctx_new();
     node.socket = zmq_socket(node.context, ZMQ_DEALER);
-    // В данной схеме вычислительные узлы подключаются к ROUTER-сокету управляющего узла,
+    // Вычислительные узлы подключаются к ROUTER-сокету управляющего узла,
     // поэтому адрес используется фиксированный
     node.address = "tcp://localhost:5555";
     if (is_child)

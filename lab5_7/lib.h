@@ -82,4 +82,4 @@ Node createProcess(int id);
 void send_mes(Node &node, message m);
 message get_mes(Node &node);
 
-#endif // LIB_H
+#endif
