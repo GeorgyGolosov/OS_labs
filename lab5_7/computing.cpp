@@ -1,113 +1,99 @@
+#include "lib.h"
 #include <iostream>
-#include <string>
+#include <map>
 #include <chrono>
 #include <thread>
-#include <map>
-#include <mutex>
-#include <cstring>
-#include "zmq.h"
-#include "lib.h"
+#include <functional>
 
-using namespace std;
+using namespace std::chrono;
 
-std::map<std::string, int> localDict;
-std::mutex dictMutex;
+Node* children_root = nullptr;
 
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <node_id> [parent_id]" << std::endl;
-        return 1;
-    }
-    string node_id = argv[1];
+int main(int argc, char *argv[])
+{
+    // Создаем узел текущего процесса
+    Node I = createNode(atoi(argv[1]), true);
+    std::map<std::string, int> dict;
 
-    // Создаем контекст и DEALER-сокет через C API
-    void* context = zmq_ctx_new();
-    void* dealer = zmq_socket(context, ZMQ_DEALER);
-    // Устанавливаем identity (идентификатор узла) для возможности маршрутизации
-    zmq_setsockopt(dealer, ZMQ_IDENTITY, node_id.c_str(), node_id.size());
-    zmq_connect(dealer, "tcp://localhost:5555");
+    // Переменные для heartbeat
+    std::chrono::milliseconds local_heartbeat(0);
+    auto last_beat = steady_clock::now();
 
-    // Создаем PUSH-сокет для отправки heartbeat-сообщений
-    void* heartbeatSocket = zmq_socket(context, ZMQ_PUSH);
-    zmq_connect(heartbeatSocket, "tcp://localhost:5557");
-
-    int heartbeatInterval = 2000; // Интервал heartbeat в мс
-
-    // Поток отправки heartbeat-сообщений
-    std::thread heartbeatThread([&]() {
-        while (true) {
-            string hb = "HEARTBEAT " + node_id;
-            zmq_msg_t msg;
-            zmq_msg_init_size(&msg, hb.size());
-            memcpy(zmq_msg_data(&msg), hb.c_str(), hb.size());
-            zmq_msg_send(&msg, heartbeatSocket, 0);
-            zmq_msg_close(&msg);
-            std::this_thread::sleep_for(std::chrono::milliseconds(heartbeatInterval));
+    while (true)
+    {
+        // Периодическая отправка heartbeat-сообщения родительскому узлу
+        if (local_heartbeat > std::chrono::milliseconds::zero() &&
+            duration_cast<milliseconds>(steady_clock::now() - last_beat).count() > local_heartbeat.count())
+        {
+            message hb(HeartBeat, I.id, -1);
+            send_mes(I, hb);
+            last_beat = steady_clock::now();
         }
-    });
 
-    // Основной цикл обработки входящих команд
-    while (true) {
-        zmq_msg_t msg;
-        zmq_msg_init(&msg);
-        int res = zmq_msg_recv(&msg, dealer, 0);
-        if (res == -1) {
-            zmq_msg_close(&msg);
-            continue;
-        }
-        // Если первый фрейм пустой (делимитер), пропускаем его и читаем следующий
-        if (zmq_msg_size(&msg) == 0) {
-            zmq_msg_close(&msg);
-            zmq_msg_init(&msg);
-            res = zmq_msg_recv(&msg, dealer, 0);
-            if (res == -1) {
-                zmq_msg_close(&msg);
-                continue;
-            }
-        }
-        string command((char*)zmq_msg_data(&msg), zmq_msg_size(&msg));
-        zmq_msg_close(&msg);
+        // Обрабатываем сообщения от дочерних узлов
+        traverseChildren(children_root, [&](Node& child) {
+            message m = get_mes(child);
+            if (m.command != None)
+                send_mes(I, m);
+        });
 
-        auto tokens = split(command);
-        string reply;
-        if (tokens.size() == 1) {  // Запрос на чтение: exec id name
-            string key = tokens[0];
-            lock_guard<mutex> lock(dictMutex);
-            auto it = localDict.find(key);
-            if (it != localDict.end())
-                reply = "Ok:" + node_id + ": " + to_string(it->second);
-            else
-                reply = "Ok:" + node_id + ": '" + key + "' not found";
-        }
-        else if (tokens.size() == 2) {  // Запись: exec id name value
-            string key = tokens[0];
-            int value = stoi(tokens[1]);
+        // Проверяем сообщение от родителя
+        message m = get_mes(I);
+        switch (m.command)
+        {
+        case Create:
+            if (m.id == I.id)
             {
-                lock_guard<mutex> lock(dictMutex);
-                localDict[key] = value;
+                Node child = createProcess(m.num);
+                Node* childPtr = new Node(child);
+                children_root = insertChild(children_root, childPtr);
+                send_mes(I, {Create, child.id, child.pid});
             }
-            reply = "Ok:" + node_id;
-        } else {
-            reply = "Error:" + node_id + ": Invalid command format";
+            else
+                traverseChildren(children_root, [&](Node& child) {
+                    send_mes(child, m);
+                });
+            break;
+        case Ping:
+            if (m.id == I.id)
+                send_mes(I, m);
+            else
+                traverseChildren(children_root, [&](Node& child) {
+                    send_mes(child, m);
+                });
+            break;
+        case ExecAdd:
+            if (m.id == I.id)
+            {
+                dict[std::string(m.st)] = m.num;
+                send_mes(I, m);
+            }
+            else
+                traverseChildren(children_root, [&](Node& child) {
+                    send_mes(child, m);
+                });
+            break;
+        case ExecFnd:
+            if (m.id == I.id)
+            {
+                if (dict.find(std::string(m.st)) != dict.end())
+                    send_mes(I, {ExecFnd, I.id, dict[std::string(m.st)], m.st});
+                else
+                    send_mes(I, {ExecErr, I.id, -1, m.st});
+            }
+            else
+                traverseChildren(children_root, [&](Node& child) {
+                    send_mes(child, m);
+                });
+            break;
+        case HeartBeat:
+            // Обновляем локальный интервал heartbeat при получении команды от управляющего узла
+            local_heartbeat = std::chrono::milliseconds(m.num);
+            break;
+        default:
+            break;
         }
-
-        // Отправляем ответ управляющему узлу в виде мультифреймового сообщения:
-        // первый фрейм – пустой делимитер, второй – данные ответа.
-        zmq_msg_t emptyMsg;
-        zmq_msg_init_size(&emptyMsg, 0);
-        zmq_msg_send(&emptyMsg, dealer, ZMQ_SNDMORE);
-        zmq_msg_close(&emptyMsg);
-
-        zmq_msg_t replyMsg;
-        zmq_msg_init_size(&replyMsg, reply.size());
-        memcpy(zmq_msg_data(&replyMsg), reply.c_str(), reply.size());
-        zmq_msg_send(&replyMsg, dealer, 0);
-        zmq_msg_close(&replyMsg);
+        usleep(1000000);
     }
-
-    heartbeatThread.join(); // На самом деле выполнение сюда не доходит
-    zmq_close(dealer);
-    zmq_close(heartbeatSocket);
-    zmq_ctx_destroy(context);
     return 0;
 }
